@@ -1,0 +1,48 @@
+{
+  "name": "semantic-memory",
+  "version": "0.1.0",
+  "description": "Local semantic memory with PGlite + pgvector - budget Qdrant for AI agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "semantic-memory": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts src/cli.ts --outdir dist --target bun",
+    "dev": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.72.0",
+    "@effect/platform-bun": "^0.52.0",
+    "@electric-sql/pglite": "^0.2.17",
+    "effect": "^3.12.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.2"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "semantic-memory",
+    "vector-search",
+    "embeddings",
+    "pglite",
+    "pgvector",
+    "mcp",
+    "ai-agents",
+    "effect-ts"
+  ],
+  "author": "Joel Hooks",
+  "license": "MIT"
+}

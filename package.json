@@ -6,10 +6,9 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "semantic-memory": "./dist/cli.js"
+    "semantic-memory": "./src/cli.ts"
   },
   "scripts": {
-    "build": "bun build src/index.ts src/cli.ts --outdir dist --target bun",
     "dev": "bun run src/cli.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"

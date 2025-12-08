@@ -3,8 +3,7 @@
   "version": "0.1.0",
   "description": "Local semantic memory with PGlite + pgvector - budget Qdrant for AI agents",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "src/index.ts",
   "bin": {
     "semantic-memory": "./src/cli.ts"
   },
@@ -30,7 +29,7 @@
     "bun": ">=1.0.0"
   },
   "files": [
-    "dist"
+    "src"
   ],
   "keywords": [
     "semantic-memory",

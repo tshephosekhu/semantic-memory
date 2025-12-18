@@ -7,9 +7,16 @@
 
 import { Effect, Console, Layer } from "effect";
 import { randomUUID } from "crypto";
+import { existsSync } from "fs";
 import { Database, makeDatabaseLive } from "./services/Database.js";
 import { Ollama, makeOllamaLive } from "./services/Ollama.js";
 import { MemoryConfig } from "./types.js";
+import {
+  needsMigration,
+  migrate,
+  importMigrationDump,
+  generateMigrationScript,
+} from "./services/Migration.js";
 
 // ============================================================================
 // Help Text
@@ -31,6 +38,7 @@ Commands:
     --limit <n>           Max results (default: 10)
     --collection <name>   Filter by collection
     --fts                 Full-text search only (no embeddings)
+    --expand              Return full content instead of truncated preview
 
   list                    List all memories
     --collection <name>   Filter by collection
@@ -39,9 +47,17 @@ Commands:
 
   delete <id>             Delete a memory by ID
 
+  validate <id>           Validate/reinforce a memory (resets decay timer)
+
   stats                   Show memory statistics
 
   check                   Verify Ollama is running
+
+  migrate                 Migrate database from PGlite 0.2.x to 0.3.x
+    --check               Check if migration is needed
+    --import <file>       Import a SQL dump file
+    --generate-script     Generate a migration helper script
+    --no-backup           Don't keep backup after migration
 
 Options:
   --help, -h              Show this help
@@ -51,6 +67,8 @@ Examples:
   semantic-memory store "Meeting notes from standup" --tags "meetings,work"
   semantic-memory find "what did we discuss in standup" --limit 5
   semantic-memory list --collection work
+  semantic-memory migrate --check
+  semantic-memory migrate --generate-script > migrate.ts
 `;
 
 // ============================================================================
@@ -94,6 +112,14 @@ const program = Effect.gen(function* () {
   const command = args[0];
   const opts = parseArgs(args.slice(1));
   const jsonOutput = opts.json === true;
+
+  // migrate command is handled separately before database initialization
+  if (command === "migrate") {
+    yield* Console.error(
+      "Error: migrate command should be handled before this point",
+    );
+    process.exit(1);
+  }
 
   const db = yield* Database;
   const ollama = yield* Ollama;
@@ -166,6 +192,12 @@ const program = Effect.gen(function* () {
       const limit = opts.limit ? parseInt(opts.limit as string, 10) : 10;
       const collection = opts.collection as string | undefined;
       const ftsOnly = opts.fts === true;
+      const expand = opts.expand === true;
+
+      // Read decay half-life from env
+      const decayHalfLife = Number(
+        process.env.MEMORY_DECAY_HALF_LIFE_DAYS ?? 90,
+      );
 
       if (!jsonOutput) {
         yield* Console.log(
@@ -173,7 +205,7 @@ const program = Effect.gen(function* () {
         );
       }
 
-      let results;
+      let results: any;
       if (ftsOnly) {
         results = yield* db.ftsSearch(query, { limit, collection });
       } else {
@@ -186,14 +218,34 @@ const program = Effect.gen(function* () {
       } else if (results.length === 0) {
         yield* Console.log("No results found");
       } else {
+        yield* Console.log(
+          `Results (decay half-life: ${decayHalfLife} days):\n`,
+        );
+        let idx = 1;
         for (const r of results) {
+          const ageDaysRounded = Math.round(r.ageDays);
+          const decayPercent = Math.round(r.decayFactor * 100);
+          const isStale = r.decayFactor < 0.5;
+
+          const contentPreview = expand
+            ? r.memory.content
+            : `${r.memory.content.slice(0, 60).replace(/\n/g, " ")}${r.memory.content.length > 60 ? "..." : ""}`;
           yield* Console.log(
-            `[${r.score.toFixed(3)}] ${r.memory.collection} - ${r.memory.id.slice(0, 8)}...`,
+            `${idx}. [score: ${r.score.toFixed(2)}, age: ${ageDaysRounded}d, decay: ${decayPercent}%] ${contentPreview}`,
           );
           yield* Console.log(
-            `  ${r.memory.content.slice(0, 200).replace(/\n/g, " ")}${r.memory.content.length > 200 ? "..." : ""}`,
+            `   Collection: ${r.memory.collection} | ID: ${r.memory.id}`,
           );
+          yield* Console.log(
+            `   Raw: ${r.rawScore.toFixed(3)} → Final: ${r.score.toFixed(3)}`,
+          );
+          if (isStale) {
+            yield* Console.log(
+              `   ⚠️ Stale (${ageDaysRounded} days) - consider validating or removing`,
+            );
+          }
           yield* Console.log("");
+          idx++;
         }
       }
       break;
@@ -217,9 +269,7 @@ const program = Effect.gen(function* () {
         for (const m of memories) {
           const tags = (m.metadata.tags as string[]) || [];
           const tagStr = tags.length ? ` [${tags.join(", ")}]` : "";
-          yield* Console.log(
-            `• ${m.id.slice(0, 8)}... (${m.collection})${tagStr}`,
-          );
+          yield* Console.log(`• ${m.id} (${m.collection})${tagStr}`);
           yield* Console.log(
             `  ${m.content.slice(0, 80).replace(/\n/g, " ")}${m.content.length > 80 ? "..." : ""}`,
           );
@@ -305,6 +355,35 @@ const program = Effect.gen(function* () {
       break;
     }
 
+    case "validate": {
+      const id = args[1];
+      if (!id) {
+        yield* Console.error("Error: ID required");
+        process.exit(1);
+      }
+
+      const memory = yield* db.get(id);
+      if (!memory) {
+        yield* Console.error(`Not found: ${id}`);
+        process.exit(1);
+      }
+
+      yield* db.validate(id);
+
+      if (jsonOutput) {
+        yield* Console.log(
+          JSON.stringify({
+            validated: id,
+            timestamp: new Date().toISOString(),
+          }),
+        );
+      } else {
+        yield* Console.log(`✓ Validated: ${id}`);
+        yield* Console.log(`  Decay timer reset to now`);
+      }
+      break;
+    }
+
     default:
       yield* Console.error(`Unknown command: ${command}`);
       yield* Console.log(HELP);
@@ -317,20 +396,122 @@ const program = Effect.gen(function* () {
 // ============================================================================
 
 const config = MemoryConfig.fromEnv();
-const ollamaLayer = makeOllamaLive(config);
-const databaseLayer = makeDatabaseLive({
-  dbPath: `${config.dataPath}/memory.db`,
-});
-const serviceLayer = Layer.merge(ollamaLayer, databaseLayer);
 
-Effect.runPromise(
-  program.pipe(
-    Effect.provide(serviceLayer),
-    Effect.catchAll((error) =>
-      Effect.gen(function* () {
-        yield* Console.error(`Error: ${error._tag}: ${JSON.stringify(error)}`);
+// Check if this is a migrate command - handle before database initialization
+const args = process.argv.slice(2);
+const command = args[0];
+
+if (command === "migrate") {
+  // Run migration without database layer
+  const migrateProgram = Effect.gen(function* () {
+    const opts = parseArgs(args.slice(1));
+    const jsonOutput = opts.json === true;
+    const dataDir = `${config.dataPath}/memory`;
+
+    if (opts.check) {
+      const needs = yield* needsMigration(dataDir);
+      if (jsonOutput) {
+        yield* Console.log(JSON.stringify({ needsMigration: needs }));
+      } else if (needs) {
+        yield* Console.log(
+          "⚠️  Migration needed: Database was created with PGlite 0.2.x (PostgreSQL 16)",
+        );
+        yield* Console.log("   Run: semantic-memory migrate");
+      } else {
+        yield* Console.log("✓ No migration needed");
+      }
+      return;
+    }
+
+    if (opts["generate-script"]) {
+      const script = generateMigrationScript(dataDir);
+      yield* Console.log(script);
+      return;
+    }
+
+    if (opts.import) {
+      const dumpPath = opts.import as string;
+      if (!existsSync(dumpPath)) {
+        yield* Console.error(`Error: Dump file not found: ${dumpPath}`);
         process.exit(1);
-      }),
+      }
+
+      yield* Console.log(`Importing from ${dumpPath}...`);
+      const result = yield* importMigrationDump(dataDir, dumpPath);
+
+      if (jsonOutput) {
+        yield* Console.log(JSON.stringify(result, null, 2));
+      } else {
+        yield* Console.log(`✓ Migration complete`);
+        yield* Console.log(`  Memories: ${result.memoriesCount}`);
+        yield* Console.log(`  Embeddings: ${result.embeddingsCount}`);
+      }
+      return;
+    }
+
+    // Default: attempt automatic migration
+    const keepBackup = opts["no-backup"] !== true;
+    yield* Console.log("Starting migration...\n");
+
+    const result = yield* migrate(dataDir, { keepBackup });
+
+    if (jsonOutput) {
+      yield* Console.log(JSON.stringify(result, null, 2));
+    } else {
+      yield* Console.log(`\n✓ Migration complete`);
+      yield* Console.log(`  Memories: ${result.memoriesCount}`);
+      yield* Console.log(`  Embeddings: ${result.embeddingsCount}`);
+      if (result.backupPath) {
+        yield* Console.log(`  Backup: ${result.backupPath}`);
+      }
+    }
+  });
+
+  Effect.runPromise(
+    migrateProgram.pipe(
+      Effect.catchAll((error) =>
+        Effect.gen(function* () {
+          if ("reason" in error) {
+            yield* Console.error(`Error: ${error.reason}`);
+          } else {
+            yield* Console.error(`Error: ${JSON.stringify(error)}`);
+          }
+          process.exit(1);
+        }),
+      ),
     ),
-  ),
-);
+  );
+} else {
+  // Normal operation with database layer
+  const ollamaLayer = makeOllamaLive(config);
+  const databaseLayer = makeDatabaseLive({
+    dbPath: `${config.dataPath}/memory.db`,
+  });
+  const serviceLayer = Layer.merge(ollamaLayer, databaseLayer);
+
+  Effect.runPromise(
+    program.pipe(
+      Effect.provide(serviceLayer),
+      Effect.catchAll((error) =>
+        Effect.gen(function* () {
+          // Check if this is a database initialization error that might need migration
+          const errorStr = JSON.stringify(error);
+          if (
+            errorStr.includes("Unreachable code") ||
+            errorStr.includes("pgl_backend")
+          ) {
+            yield* Console.error(
+              "Error: Database initialization failed. This may be due to a PGlite version mismatch.",
+            );
+            yield* Console.error("Run: semantic-memory migrate --check");
+          } else {
+            yield* Console.error(
+              `Error: ${error._tag}: ${JSON.stringify(error)}`,
+            );
+          }
+          process.exit(1);
+        }),
+      ),
+    ),
+  );
+}
